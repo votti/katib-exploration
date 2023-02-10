@@ -221,11 +221,21 @@ def train(
     with open(metrics_log_path, "w") as f:
         f.write(f"val-accuracy={history.history['val_accuracy'][0]}\n")
         f.write(f"accuracy={history.history['accuracy'][0]}\n")
+    print(metrics_log_path)
 
 
 train_op = create_component_from_func(
     func=train, base_image="tensorflow/tensorflow:2.7.1", packages_to_install=["scipy"]
 )
+
+
+# %%
+def _label_cache(step):
+    """Helper to add pod cache label
+
+    Somehow in our configuration the wrong cache label is applied :/
+    """
+    step.add_pod_label("pipelines.kubeflow.org/cache_enabled", "true")
 
 
 # %%
@@ -245,8 +255,11 @@ def mnist_training_pipeline(
 
     train_imgs = download_data_op(TRAIN_IMG_URL)
     train_imgs.set_display_name("Download training images")
+    _label_cache(train_imgs)
+
     train_y = download_data_op(TRAIN_LAB_URL)
     train_y.set_display_name("Download training labels")
+    _label_cache(train_y)
 
     mnist_train = parse_mnist_op(train_imgs.output, train_y.output)
     mnist_train.set_display_name("Prepare train dataset")
@@ -254,15 +267,19 @@ def mnist_training_pipeline(
     processed_train = process_op(mnist_train.output, val_pct=0.2, trainset_flag=True)
     processed_train.set_display_name("Preprocess images")
 
-    model_out = train_op(
-        processed_train.output,
-        lr=lr,
-        optimizer=optimizer,
-        epochs=epochs,
-        batch_size=batch_size,
-        loss=loss,
+    training_output = (
+        train_op(
+            processed_train.outputs["data_processed"],
+            lr=lr,
+            optimizer=optimizer,
+            epochs=epochs,
+            batch_size=batch_size,
+            loss=loss,
+        )
+        .set_cpu_limit("1")
+        .set_memory_limit("1Gi")
     )
-    model_out.set_display_name("Fit the model")
+    training_output.set_display_name("Fit the model")
     return mnist_train.output
 
 
@@ -274,51 +291,20 @@ run = client.create_run_from_pipeline_func(
     # pipeline_root='gs://my-pipeline-root/example-pipeline',
     arguments={},
     experiment_name="mnist",
-    run_name="training_mnist_classifier",
+    run_name="training_mnist_classifier_13",
     namespace="vito-zanotelli",
 )
+
 
 # %% [markdown]
 # # Parameter tuning with Katib
 #
-# We now want to do parameter tuning over the pipeline with Katib
+# We now want to do parameter tuning over the pipeline with Katib.
 #
-# To do this, we need to extend the pipeline with a step to do metrics collection.
-# This is currently done in a hacky way using a separate step/component
-
-# %%
-print_file_op = components.load_component_from_text(
-    """
-name: Sleepy print file
-description: Helper container to print input to stdout.
-    Contains a sleep step to prevent race conditions in container
-    startup.
-    Note that this command is broken - but currently this seems to work
-    well together with the broken metrics collection sidecar injection of Katib
-    that will modify this command by concatenating it.
-
-inputs:
-- {name: data, type: String}
-
-implementation:
-  container:
-    image: busybox
-    command:
-      - sleep 60 &&
-      - cat
-      - {inputPath: data}
-"""
-)
-
-
-# %%
-def _label_cache(step):
-    """Helper to add pod cache label
-
-    Somehow in our configuration the wrong cache label is applied :/
-    """
-    step.add_pod_label("pipelines.kubeflow.org/cache_enabled", "true")
-
+# This requires:
+# - adding a label to the step from which parameters should be collected
+# - preventing that the step generating parameters is not skipped due to caching
+#
 
 # %%
 def mnist_training_pipeline_katib(
@@ -346,33 +332,30 @@ def mnist_training_pipeline_katib(
     processed_train = process_op(mnist_train.output, val_pct=0.2, trainset_flag=True)
     processed_train.set_display_name("Preprocess images")
 
-    training_output = train_op(
-        processed_train.outputs["data_processed"],
-        lr=lr,
-        optimizer=optimizer,
-        epochs=epochs,
-        batch_size=batch_size,
-        loss=loss,
+    training_output = (
+        train_op(
+            processed_train.outputs["data_processed"],
+            lr=lr,
+            optimizer=optimizer,
+            epochs=epochs,
+            batch_size=batch_size,
+            loss=loss,
+        )
+        .set_cpu_limit("1")
+        .set_memory_limit("1Gi")
     )
-    _label_cache(training_output)
 
-    # The printing op is required such that the metrics collector sidecar
-    # can collect the metrics.
-    # This is a workaround required as the side-car injection of katib
-    # breaks complex commands, such as the one of the python training operator
-    po = print_file_op(training_output.outputs["metrics_log"])
+    training_output.set_display_name("Fit the model")
     # This step needs to run always, as otherwise the metrics cannot be collected.
     # Other steps are cached if appropriate
-    po.execution_options.caching_strategy.max_cache_staleness = "P0D"
+    training_output.execution_options.caching_strategy.max_cache_staleness = "P0D"
+
     # This pod label indicates which pod Katib should collect the metric from.
     # A metrics collecting sidecar container will be added
-    po.add_pod_label("katib.kubeflow.org/model-training", "true")
-    _label_cache(po)
+    training_output.add_pod_label("katib.kubeflow.org/model-training", "true")
 
 
 # %%
-# Note: this pipeline will not work, as the print op is only working when the Metrics collector sidecar is injected
-
 run = client.create_run_from_pipeline_func(
     mnist_training_pipeline_katib,
     mode=kfp.dsl.PipelineExecutionMode.V1_LEGACY,
@@ -475,6 +458,43 @@ def create_trial_template(trial_spec):
 
 
 # %%
+def create_metrics_collector_spec():
+    """This defines the custom metrics collector"""
+    return {
+        "source": {
+            "fileSystemPath": {
+                "path": "/tmp/outputs/mlpipeline_metrics/data",
+                "kind": "File",
+            }
+        },
+        "collector": {
+            "kind": "Custom",
+            "customCollector": {
+                "args": [
+                    "-m",
+                    "val-accuracy;accuracy",
+                    "-s",
+                    "katib-db-manager.kubeflow:6789",
+                    "-t",
+                    "$(PodName)",
+                    "-path",
+                    "/tmp/outputs/mlpipeline_metrics",
+                ],
+                "image": "votti/kfpv1-metricscollector:v0.0.10",
+                "imagePullPolicy": "Always",
+                "name": "custom-metrics-logger-and-collector",
+                "env": [
+                    {
+                        "name": "PodName",
+                        "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}},
+                    }
+                ],
+            },
+        },
+    }
+
+
+# %%
 def create_katib_experiment_spec(
     trial_spec,
     max_trial_count: int = 2,
@@ -514,6 +534,9 @@ def create_katib_experiment_spec(
     # Configure parameters for the Trial template.
     trial_template = create_trial_template(trial_spec)
 
+    # Metrics collector spec
+    metrics_collector = create_metrics_collector_spec()
+
     # Create an Experiment from the above parameters.
     experiment_spec = V1beta1ExperimentSpec(
         # Experimental Budget
@@ -528,6 +551,8 @@ def create_katib_experiment_spec(
         parameters=parameters,
         # Trial Template
         trial_template=trial_template,
+        # Metrics collector
+        metrics_collector_spec=metrics_collector,
     )
 
     return experiment_spec
@@ -549,22 +574,31 @@ trial_spec["spec"]["serviceAccountName"] = "default-editor"
 katib_spec = create_katib_experiment_spec(trial_spec)
 
 # %% [markdown]
-# In order to generate a full experiment, name and namespace need to be defined
+# In order to generate a full experiment the api_version, kind and namespace need to be defined:
 
 # %%
 katib_experiment = V1beta1Experiment(
+    api_version="kubeflow.org/v1beta1",
+    kind="Experiment",
     metadata=V1ObjectMeta(
-        name="katib-kfp-mnist",
-        namespace=client.get_user_namespace(),
+        name="katib-kfp-mnist-custom-31",
+        namespace="vito-zanotelli",
     ),
     spec=katib_spec,
 )
 
 # %% [markdown]
-# The generated yaml can be submitted via web ui - I did not manage yet to submitt via sdk
+# The generated yaml can written out to submit via the web ui:
 
 # %%
-with open("experiment_template_kfp_mnist.yaml", "w") as f:
+with open("experiment_template_kfp_mnist_4.yaml", "w") as f:
     yaml.dump(ApiClient().sanitize_for_serialization(katib_experiment), f)
 
+# %% [markdown]
+# Or sumitted via the KatibClient:
+
 # %%
+client = KatibClient()
+
+# %%
+client.create_experiment(katib_experiment)
