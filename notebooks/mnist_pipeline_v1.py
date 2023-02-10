@@ -389,6 +389,8 @@ from kubeflow.katib import V1beta1ParameterSpec
 from kubeflow.katib import V1beta1FeasibleSpace
 from kubeflow.katib import V1beta1TrialTemplate
 from kubeflow.katib import V1beta1TrialParameterSpec
+from kubeflow.katib import V1beta1MetricsCollectorSpec
+from kubeflow.katib import V1beta1CollectorSpec
 
 
 # %% [markdown]
@@ -486,16 +488,16 @@ def create_trial_template(trial_spec):
 # %%
 def create_metrics_collector_spec():
     """This defines the custom metrics collector"""
-    return {
-        "source": {
+    return V1beta1MetricsCollectorSpec(
+        source={
             "fileSystemPath": {
                 "path": "/tmp/outputs/mlpipeline_metrics/data",
                 "kind": "File",
             }
         },
-        "collector": {
-            "kind": "Custom",
-            "customCollector": {
+        collector=V1beta1CollectorSpec(
+            kind="Custom",
+            custom_collector={
                 "args": [
                     "-m",
                     "val-accuracy;accuracy",
@@ -516,8 +518,8 @@ def create_metrics_collector_spec():
                     }
                 ],
             },
-        },
-    }
+        ),
+    )
 
 
 # %%
@@ -607,7 +609,7 @@ katib_experiment = V1beta1Experiment(
     api_version="kubeflow.org/v1beta1",
     kind="Experiment",
     metadata=V1ObjectMeta(
-        name="katib-kfp-mnist-custom-31",
+        name="katib-kfp-mnist-custom-32",
         namespace="vito-zanotelli",
     ),
     spec=katib_spec,
@@ -617,7 +619,7 @@ katib_experiment = V1beta1Experiment(
 # The generated yaml can written out to submit via the web ui:
 
 # %%
-with open("experiment_template_kfp_mnist_4.yaml", "w") as f:
+with open("experiment_template_kfp_mnist_v1.yaml", "w") as f:
     yaml.dump(ApiClient().sanitize_for_serialization(katib_experiment), f)
 
 # %% [markdown]
