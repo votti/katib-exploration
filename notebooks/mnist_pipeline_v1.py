@@ -396,11 +396,37 @@ from kubeflow.katib import V1beta1TrialParameterSpec
 #
 # In this case the trial spec is an Argo workflow produced form the Kubeflow pipeline.
 #
-# The requirement to run this Argo workflow, the integration needs to be setup:
+# The requirement to run this Argo workflow, the integration needs to be setup.
+#
+#
+# ### Setup of Katib Argo workflow integration
+# If you are running on a full Kubeflow installation *DO NOT INSTALL ARGO* as this will likely break your installation.
+#
+# Just run the following commands:
+#
+# Enable side-car injection:
+#
+# `kubectl patch namespace argo -p '{"metadata":{"labels":{"katib.kubeflow.org/metrics-collector-injection":"enabled"}}}'`
+#
+#
+# Verify that the emissary executor is active (should be default in newer Kubeflow installations):
+#
+# ` kubectl get ConfigMap -n argo workflow-controller-configmap -o yaml | grep containerRuntimeExecutor`
+#
+# Patch the Katib controller:
+#
+# `kubectl patch ClusterRole katib-controller -n kubeflow --type=json \
+#   -p='[{"op": "add", "path": "/rules/-", "value": {"apiGroups":["argoproj.io"],"resources":["workflows"],"verbs":["get", "list", "watch", "create", "delete"]}}]'
+# `
+#
+# `kubectl patch Deployment katib-controller -n kubeflow --type=json \
+#   -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--trial-resources=Workflow.v1alpha1.argoproj.io"}]'`
+#
+# For more details and how to set this up on a partial Kubeflow installation follow:
 # https://github.com/kubeflow/katib/tree/master/examples/v1beta1/argo/README.md
 
 # %% [markdown]
-# ### Helper functions
+# ### Helper functions to build the individual Katib Experiment Components
 
 # %%
 def create_trial_spec(pipeline, params_list: List[dsl.PipelineParam]):
@@ -559,7 +585,7 @@ def create_katib_experiment_spec(
 
 
 # %% [markdown]
-# ## Create actual trial spec
+# ### Create Katib Experiment from components
 
 # %%
 trial_spec = create_trial_spec(
@@ -602,3 +628,11 @@ client = KatibClient()
 
 # %%
 client.create_experiment(katib_experiment)
+
+# %% [markdown]
+# You should now be able to observe in the Web UI how the Katib
+# Experiment is running.
+#
+# To see how the `Argo Workflows` are started, you can also check the Kubernetes cluster:
+#
+# `kubectl get Workflow -n <namespace>`
